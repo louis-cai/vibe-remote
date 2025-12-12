@@ -24,6 +24,10 @@ from .formatters import TelegramFormatter
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+# Leave headroom for escaping overhead/extra markup to avoid Telegram 400 errors
+TELEGRAM_SAFE_CHUNK_LENGTH = TELEGRAM_MAX_MESSAGE_LENGTH - 100
+
 
 class TelegramBot(BaseIMClient):
     def __init__(self, config: TelegramConfig):
@@ -50,6 +54,38 @@ class TelegramBot(BaseIMClient):
             for char in escape_chars:
                 text = text.replace(char, f'\\{char}')
             return text
+
+    def _split_message(self, text: str, max_length: int = TELEGRAM_SAFE_CHUNK_LENGTH) -> list[str]:
+        """Split long messages to respect Telegram's 4096 char limit"""
+        if len(text) <= max_length:
+            return [text]
+
+        chunks = []
+        current_lines = []
+        current_len = 0
+
+        for line in text.splitlines(keepends=True):
+            line_len = len(line)
+
+            # If the current line alone exceeds max_length, hard split it
+            while line_len > max_length:
+                chunks.append(line[:max_length])
+                line = line[max_length:]
+                line_len = len(line)
+
+            if current_len + line_len > max_length:
+                if current_lines:
+                    chunks.append("".join(current_lines))
+                current_lines = [line]
+                current_len = line_len
+            else:
+                current_lines.append(line)
+                current_len += line_len
+
+        if current_lines:
+            chunks.append("".join(current_lines))
+
+        return chunks
     
     
     def get_default_parse_mode(self) -> str:
@@ -265,17 +301,30 @@ class TelegramBot(BaseIMClient):
 
         # Convert markdown to MarkdownV2 for better compatibility
         markdownv2_text = self._convert_to_markdownv2(text)
-        kwargs = {"chat_id": chat_id, "text": markdownv2_text}
 
-        # Always use MarkdownV2 since we converted with markdownify
-        kwargs["parse_mode"] = "MarkdownV2"
-
-        if reply_to or context.thread_id:
-            kwargs["reply_to_message_id"] = int(reply_to or context.thread_id)
+        chunks = self._split_message(markdownv2_text)
+        reply_to_message_id = int(reply_to or context.thread_id) if (reply_to or context.thread_id) else None
+        last_message_id: Optional[int] = None
 
         try:
-            message = await bot.send_message(**kwargs)
-            return str(message.message_id)
+            for idx, chunk in enumerate(chunks):
+                kwargs = {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "MarkdownV2",
+                }
+
+                # Reply only the first chunk to the original message, subsequent chunks reply to previous chunk
+                if reply_to_message_id and idx == 0:
+                    kwargs["reply_to_message_id"] = reply_to_message_id
+                elif last_message_id is not None:
+                    kwargs["reply_to_message_id"] = last_message_id
+
+                message = await bot.send_message(**kwargs)
+                last_message_id = message.message_id
+
+            # Return the last message id sent (most recent in the chain)
+            return str(last_message_id)
         except TelegramError as e:
             logger.error(f"Error sending message: {e}")
             raise
@@ -292,6 +341,12 @@ class TelegramBot(BaseIMClient):
 
         # Convert markdown to MarkdownV2 for better compatibility
         markdownv2_text = self._convert_to_markdownv2(text)
+        chunks = self._split_message(markdownv2_text)
+
+        if len(chunks) > 1:
+            logger.warning(
+                "Message with buttons exceeded Telegram limit; sending first chunk with buttons and the rest as follow-ups"
+            )
 
         # Convert our generic keyboard to Telegram keyboard
         tg_keyboard = []
@@ -311,11 +366,23 @@ class TelegramBot(BaseIMClient):
         try:
             message = await bot.send_message(
                 chat_id=chat_id,
-                text=markdownv2_text,
+                text=chunks[0],
                 parse_mode="MarkdownV2",
                 reply_markup=reply_markup,
             )
-            return str(message.message_id)
+
+            # Send any additional chunks as plain follow-ups replying to the previous chunk
+            last_message_id = message.message_id
+            for chunk in chunks[1:]:
+                follow_up = await bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode="MarkdownV2",
+                    reply_to_message_id=last_message_id,
+                )
+                last_message_id = follow_up.message_id
+
+            return str(last_message_id)
         except TelegramError as e:
             logger.error(f"Error sending message with buttons: {e}")
             raise
